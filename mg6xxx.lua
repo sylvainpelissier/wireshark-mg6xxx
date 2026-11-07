@@ -6,8 +6,9 @@
 -- reads (zone/keypad/repeater/siren labels and serials, panel clock), and
 -- writes (op 0x01, e.g. a user code), the service 0x1a programming
 -- session around them, service 0x18 control commands (arm, arm stay, arm
--- sleep, disarm), zone open/closed
--- (object 0x1e) and the change counter BabyWare polls (object 0x1c).
+-- sleep, disarm), zone open/closed and alarm flags
+-- (object 0x1e), partition exit delay/armed/alarm (object 0x25, provisional)
+-- and the change counter BabyWare polls (object 0x1c).
 -- Also the cleartext event frames the panel sends on its own, using the
 -- layout of https://github.com/bmpc/mg6250_mqtt (paradox_serial_connect.py):
 -- any other command whose body is N x 37 bytes. Not yet checked against a
@@ -35,6 +36,9 @@ p.prefs.session_keys = Pref.string("Session keys (hex)", "",
         .. "commas or spaces. Copy one from Session key (mg6xxx.login.session_key) "
         .. "in the capture that has the login. A key is used only if the decrypted "
         .. "header matches the frame's selector and mode.")
+p.prefs.bridge_port = Pref.uint("Serial bridge TCP port", 6638,
+    "TCP port of a serial-over-TCP bridge (ESPHome stream_server, ser2net) carrying "
+        .. "the panel's serial bytes. The panel is on the side using this port.")
 
 local CMD = { [0x00] = "Identify", [0x01] = "Login", [0x24] = "Data" }
 local LOGIN_STATUS = {
@@ -50,19 +54,91 @@ local SERVICE = { [0x17] = "Objects", [0x18] = "Control", [0x1a] = "Programming"
 local OP = { [0x00] = "Read", [0x01] = "Write" }
 local OBJ = {
     [0x0001] = "Zone",
+    [0x0003] = "Doorbell",
+    [0x0005] = "PGM output",
+    [0x0007] = "User",
     [0x0009] = "Keypad",
     [0x000b] = "Repeater",
     [0x000d] = "Siren",
+    [0x0011] = "Phone number",
+    [0x0015] = "IP receiver?",
+    [0x0016] = "Account",
+    [0x0017] = "System settings",
     [0x001c] = "System",
-    [0x0019] = "User",
+    [0x0019] = "Installer / PC login",
+    [0x001a] = "Area",
     [0x001e] = "Zone status",
     [0x0024] = "Clock",
+    [0x0025] = "Partition status",
 }
 -- objects whose field 0 is a serial and field 1 a 16-byte label
 local LABELLED = { [0x0001] = true, [0x0009] = true, [0x000b] = true, [0x000d] = true }
 local OBJ_CLOCK = 0x0024
+-- Field 3: [2030] entry delay audio | [2031] exit delay audio (BabyWare wrote
+-- 02 05 after selecting Tonality 3 for the exit delay, exit-delay-audio).
+-- One byte each: the exit delay sound is not set per arm type.
+local OBJ_SETTINGS = 0x0017
+local DELAY_AUDIO = {
+    [0] = "No tone",
+    [1] = "Beeping",
+    [2] = "Countdown",
+    [3] = "Tonality 1",
+    [4] = "Tonality 2",
+    [5] = "Tonality 3",
+    [6] = "Tonality 4",
+}
+-- Zone field 0: device (2) | definition | partition | options | ?
+-- (change-zone: BabyWare wrote definition 09 -> 08 for zones 4-7)
+local OBJ_ZONE = 0x0001
+-- MG6250 programming guide, table 4 (BabyWare's names)
+local ZONE_DEFINITION = {
+    [0] = "Disabled",
+    [1] = "Entry Delay 1",
+    [2] = "Entry Delay 2",
+    [3] = "Entry Delay 1 (Full Arm)",
+    [4] = "Entry Delay 2 (Full Arm)",
+    [5] = "Follow",
+    [6] = "Follow (Sleep / Full Arm)",
+    [7] = "Follow (Full Arm)",
+    [8] = "Instant",
+    [9] = "Instant (Sleep / Full Arm)",
+    [10] = "Instant (Full Arm)",
+    [11] = "Instant Fire",
+    [12] = "Delayed Fire",
+    [13] = "Instant Fire Silent",
+    [14] = "Delayed Fire Silent",
+    [15] = "24Hr Buzzer",
+    [16] = "24Hr Burglary",
+    [17] = "24Hr Hold Up",
+    [18] = "24Hr Gas",
+    [19] = "24Hr Heat",
+    [20] = "24Hr Water",
+    [21] = "24Hr Freeze",
+    [22] = "24Hr Panic",
+    [23] = "Follow No Pre-Alarm",
+    [24] = "Instant No Pre-Alarm",
+    [25] = "Keyswitch Maintain",
+    [26] = "Keyswitch Momentary",
+    [27] = "Entry Delay 1 (Sleep / Full Arm)",
+    [28] = "Entry Delay 2 (Sleep / Full Arm)",
+    [29] = "Unarmed",
+    [33] = "Custom 1",
+    [34] = "Custom 2",
+    [35] = "Custom 3",
+    [36] = "Custom 4",
+}
+-- table 5
+local ZONE_PARTITION = { [1] = "Partition 1", [2] = "Partition 2", [3] = "Both partitions" }
+-- table 6, options 4-5
+local ZONE_ALARM_TYPE = { [0] = "Audible", [1] = "Silent", [2] = "Audible pulse", [3] = "Report only" }
 local OBJ_SYSTEM = 0x001c -- field 1 byte 0: change counter
-local OBJ_ZONE_STATUS = 0x001e -- field 0 byte 0: 1 = open
+local OBJ_ZONE_STATUS = 0x001e -- field 0 byte 0: non-zero = open (04 in alarm), byte 1: flags
+-- disarmed 00 00 00; exit delay 01 / 02 / 03 00 01, armed 05 / 06 / 07
+-- 00 00 for stay / sleep / full arm (armed-stay-*, slepp-armed-*,
+-- alarm-ir-etage); alarm (full arm, zone 15) 77 02 40, provisional.
+-- Index 1-2: partition 1-2 (BabyWare reads both, #2 stayed zero).
+local OBJ_PARTITION_STATUS = 0x0025
+local ARM_MODE = { [0] = "Disarmed", [1] = "Stay", [2] = "Sleep", [3] = "Full" }
 
 -- Cleartext events (bmpc/mg6250_mqtt): codes and sub-events it handles
 local EVENT_LEN = 37
@@ -86,7 +162,15 @@ local SERVICE_PROGRAMMING = 0x1a
 -- service 0x1a byte 0; BabyWare brackets every write with Begin ... End
 local PROGRAMMING_OP = { [0x00] = "Begin", [0x01] = "End" }
 local VOLTS_PER_STEP = 0.08 -- clock field 2 (battery, AC); one reading
-local OBJ_USER = 0x0019 -- field 1: code, BCD (change-user-code captures)
+-- receive-all: users 1-16, field 1 label, field 4 code (System Master's
+-- matches the user code). 0x19 field 1 has the same layout and holds the
+-- installer code (A6 27 for 0627: A = digit 0?); change-user-code wrote
+-- 0x19, not 0x07. 0x19 field 3: login name and PC password, 16 bytes each.
+local OBJ_USER = 0x0007
+local OBJ_INSTALLER = 0x0019
+local OBJ_AREA = 0x001a -- field 1 byte 0: exit delay (30 s, as on arming)
+-- label field of objects whose field 0 is not a serial
+local LABEL_FIELD = { [0x0003] = 1, [0x0005] = 1, [0x0007] = 1, [0x001a] = 2 }
 -- service 0x18 action byte, one capture each
 local CONTROL_ACTION = {
     [0x10] = "Disarm", -- arm-full-09
@@ -144,7 +228,30 @@ local f = {
     fid = ProtoField.uint8("mg6xxx.field.id", "Field id", base.DEC),
     flen = ProtoField.uint16("mg6xxx.field.len", "Field length", base.DEC),
     serial = ProtoField.bytes("mg6xxx.field.serial", "Serial (zero: nothing enrolled)"),
+    -- zone field 0; options bits as the guide's table 6 (options 1-8 = bits 0-7):
+    -- 87 on every zone, matching the defaults, alarm type audible
+    zone_device = ProtoField.bytes("mg6xxx.field.zone_device",
+        "Device (zero: nothing enrolled; part of the RF serial?)"),
+    zone_def = ProtoField.uint8("mg6xxx.field.zone_definition", "Zone definition", base.DEC, ZONE_DEFINITION),
+    zone_partition = ProtoField.uint8("mg6xxx.field.zone_partition", "Partition", base.DEC, ZONE_PARTITION),
+    zone_options = ProtoField.uint8("mg6xxx.field.zone_options", "Options (provisional)", base.HEX),
+    zone_opt_shutdown = ProtoField.bool("mg6xxx.field.zone_options.auto_shutdown",
+        "Auto zone shutdown", 8, nil, 0x01),
+    zone_opt_bypass = ProtoField.bool("mg6xxx.field.zone_options.bypassable", "Bypassable", 8, nil, 0x02),
+    zone_opt_supervision = ProtoField.bool("mg6xxx.field.zone_options.rf_supervision",
+        "RF supervision", 8, nil, 0x04),
+    zone_opt_alarm_type = ProtoField.uint8("mg6xxx.field.zone_options.alarm_type", "Alarm type",
+        base.DEC, ZONE_ALARM_TYPE, 0x18),
+    zone_opt_intellizone = ProtoField.bool("mg6xxx.field.zone_options.intellizone",
+        "Intellizone delay", 8, nil, 0x20),
+    zone_opt_delay_tx = ProtoField.bool("mg6xxx.field.zone_options.delay_transmission",
+        "Delay arm transmission", 8, nil, 0x40),
+    zone_opt_force = ProtoField.bool("mg6xxx.field.zone_options.force_arming", "Force arming", 8, nil, 0x80),
     label = ProtoField.string("mg6xxx.field.label", "Label"),
+    entry_audio = ProtoField.uint8("mg6xxx.field.entry_delay_audio", "Entry delay audio [2030]",
+        base.DEC, DELAY_AUDIO),
+    exit_audio = ProtoField.uint8("mg6xxx.field.exit_delay_audio", "Exit delay audio [2031]",
+        base.DEC, DELAY_AUDIO),
     date = ProtoField.string("mg6xxx.field.date", "Panel date"),
 
     ev_seq = ProtoField.uint8("mg6xxx.event.seq", "Sequence", base.DEC),
@@ -158,11 +265,32 @@ local f = {
     ctl_serial = ProtoField.bytes("mg6xxx.control.serial", "Panel serial (as in the identify reply)"),
     battery = ProtoField.float("mg6xxx.field.battery", "Battery voltage (assumed 0.08 V/step)"),
     ac = ProtoField.float("mg6xxx.field.ac", "AC voltage (assumed 0.08 V/step)"),
-    user_code = ProtoField.string("mg6xxx.field.user_code", "User code (BCD, first 4 digits)"),
+    user_code = ProtoField.string("mg6xxx.field.user_code", "Code (BCD, first 4 digits)"),
+    pc_login = ProtoField.string("mg6xxx.field.pc_login", "Login name"),
+    pc_password = ProtoField.string("mg6xxx.field.pc_password", "PC password"),
+    area_exit_delay = ProtoField.uint8("mg6xxx.field.area_exit_delay", "Exit delay (s)", base.DEC),
     user_code_rep = ProtoField.uint8("mg6xxx.field.user_code_rep",
         "Repeats digits 1-2 (in both captures; meaning unknown)", base.HEX),
     prog_op = ProtoField.uint8("mg6xxx.programming.op", "Programming", base.HEX, PROGRAMMING_OP),
     zone_open = ProtoField.bool("mg6xxx.field.zone_open", "Zone open"),
+    -- zone status byte 1, provisional (alarm-ir-etage, set-sms)
+    zone_flags = ProtoField.uint8("mg6xxx.field.zone_flags", "Zone flags (provisional)", base.HEX),
+    zone_exit_delay = ProtoField.bool("mg6xxx.field.zone_exit_delay",
+        "Exit delay (all zones, after arm)", 8, nil, 0x04),
+    zone_in_alarm = ProtoField.bool("mg6xxx.field.zone_in_alarm", "In alarm", 8, nil, 0x10),
+    zone_alarm_memory = ProtoField.bool("mg6xxx.field.zone_alarm_memory",
+        "Alarm in memory (also set on a closed zone after an alarm)", 8, nil, 0x20),
+    part_state = ProtoField.uint8("mg6xxx.field.partition_state", "State (provisional)", base.HEX),
+    part_arming = ProtoField.uint8("mg6xxx.field.partition_arm_mode",
+        "Arm mode (from the arm on, exit delay included)", base.DEC, ARM_MODE, 0x03),
+    part_armed = ProtoField.bool("mg6xxx.field.partition_armed", "Armed (exit delay over)", 8, nil, 0x04),
+    part_alarm = ProtoField.bool("mg6xxx.field.partition_alarm",
+        "Alarm (0x10, 0x20, 0x40: all set in the one sample)", 8, nil, 0x70),
+    part_flags2 = ProtoField.uint8("mg6xxx.field.partition_flags2",
+        "Flags (alarm: 0x02, meaning unknown)", base.HEX),
+    part_flags3 = ProtoField.uint8("mg6xxx.field.partition_flags3", "Flags", base.HEX),
+    part_exit_delay = ProtoField.bool("mg6xxx.field.partition_exit_delay", "Exit delay", 8, nil, 0x01),
+    part_alarm3 = ProtoField.bool("mg6xxx.field.partition_alarm3", "Alarm (meaning unknown)", 8, nil, 0x40),
     change_counter = ProtoField.uint8("mg6xxx.field.change_counter",
         "Change counter (BabyWare re-reads zone status when it changes)", base.DEC),
     ctl_action = ProtoField.uint8("mg6xxx.control.action", "Action", base.HEX, CONTROL_ACTION),
@@ -419,7 +547,19 @@ end
 
 -- Known field values; anything else is uninterpreted
 local function interpret_value(rt, ft, obj, fid, v, size)
-    if LABELLED[obj] and fid == 0 then
+    if obj == OBJ_ZONE and fid == 0 and size >= 5 then
+        ft:add(f.zone_device, v(0, 2))
+        ft:add(f.zone_def, v(2, 1))
+        ft:add(f.zone_partition, v(3, 1))
+        local ot = ft:add(f.zone_options, v(4, 1))
+        for _, o in ipairs({ f.zone_opt_shutdown, f.zone_opt_bypass, f.zone_opt_supervision,
+            f.zone_opt_alarm_type, f.zone_opt_intellizone, f.zone_opt_delay_tx, f.zone_opt_force }) do
+            ot:add(o, v(4, 1))
+        end
+        add_uninterp(ft, v, 5, size)
+        local def = v(2, 1):uint()
+        rt:append_text(": " .. (ZONE_DEFINITION[def] or string.format("definition %d", def)))
+    elseif LABELLED[obj] and fid == 0 then
         ft:add(f.serial, v)
     elseif LABELLED[obj] and fid == 1 then
         ft:add(f.label, v)
@@ -427,8 +567,47 @@ local function interpret_value(rt, ft, obj, fid, v, size)
     elseif obj == OBJ_ZONE_STATUS and fid == 0 then
         local open = v(0, 1):uint() ~= 0
         ft:add(f.zone_open, v(0, 1), open)
-        add_uninterp(ft, v, 1, size)
         rt:append_text(open and ": open" or ": closed")
+        if size >= 2 then
+            local flags = v(1, 1):uint()
+            local zt = ft:add(f.zone_flags, v(1, 1))
+            zt:add(f.zone_exit_delay, v(1, 1))
+            zt:add(f.zone_in_alarm, v(1, 1))
+            zt:add(f.zone_alarm_memory, v(1, 1))
+            if flags & 0x10 ~= 0 then
+                rt:append_text(", in alarm")
+            elseif flags & 0x20 ~= 0 then
+                rt:append_text(", alarm in memory")
+            end
+        end
+        add_uninterp(ft, v, 2, size)
+    elseif obj == OBJ_PARTITION_STATUS and fid == 0 and size >= 3 then
+        local state, flags3 = v(0, 1):uint(), v(2, 1):uint()
+        local st = ft:add(f.part_state, v(0, 1))
+        st:add(f.part_arming, v(0, 1))
+        st:add(f.part_armed, v(0, 1))
+        st:add(f.part_alarm, v(0, 1))
+        ft:add(f.part_flags2, v(1, 1))
+        local t3 = ft:add(f.part_flags3, v(2, 1))
+        t3:add(f.part_exit_delay, v(2, 1))
+        t3:add(f.part_alarm3, v(2, 1))
+        add_uninterp(ft, v, 3, size)
+        local mode = string.lower(ARM_MODE[state & 0x03])
+        if state & 0x70 ~= 0 then
+            rt:append_text(": alarm")
+        elseif flags3 & 0x01 ~= 0 then
+            rt:append_text(": exit delay (" .. mode .. ")")
+        elseif state & 0x04 ~= 0 then
+            rt:append_text(": armed (" .. mode .. ")")
+        elseif state == 0 then
+            rt:append_text(": disarmed")
+        end
+    elseif obj == OBJ_SETTINGS and fid == 3 and size >= 2 then
+        ft:add(f.entry_audio, v(0, 1))
+        ft:add(f.exit_audio, v(1, 1))
+        add_uninterp(ft, v, 2, size)
+        local exit = v(1, 1):uint()
+        rt:append_text(": exit delay audio " .. (DELAY_AUDIO[exit] or string.format("%d", exit)))
     elseif obj == OBJ_SYSTEM and fid == 1 then
         ft:add(f.change_counter, v(0, 1))
         add_uninterp(ft, v, 1, size)
@@ -447,9 +626,20 @@ local function interpret_value(rt, ft, obj, fid, v, size)
         ft:add(f.date, v(0, 6), date)
         add_uninterp(ft, v, 6, size)
         rt:append_text(": " .. date)
-    elseif obj == OBJ_USER and fid == 1 and size >= 2 then
+    elseif LABEL_FIELD[obj] == fid then
+        ft:add(f.label, v)
+        rt:append_text(": " .. v:string():gsub("[%z ]+$", ""))
+    elseif obj == OBJ_INSTALLER and fid == 3 and size >= 32 then
+        ft:add(f.pc_login, v(0, 16))
+        ft:add(f.pc_password, v(16, 16))
+        add_uninterp(ft, v, 32, size)
+    elseif obj == OBJ_AREA and fid == 1 then
+        ft:add(f.area_exit_delay, v(0, 1))
+        add_uninterp(ft, v, 1, size)
+    elseif ((obj == OBJ_USER and fid == 4) or (obj == OBJ_INSTALLER and fid == 1)) and size >= 2 then
         -- 4225 -> 42 25 42 00, 1234 -> 12 34 12 00: byte 2 repeats the first
         -- two digits (a 6-digit field filled cyclically?); byte 3 unknown
+        -- (00 in 0x19, 05 or 07 in the users)
         ft:add(f.user_code, v(0, 2), tostring(v(0, 2):bytes()))
         if size >= 3 then
             local rep = ft:add(f.user_code_rep, v(2, 1))
@@ -780,21 +970,9 @@ local function dissect_frame(t, root, dir, key)
     return info
 end
 
-local function heuristic(tvb, pinfo, tree)
-    -- USB addresses are "host" and "bus.device.endpoint". They are set even
-    -- when no tree is built (first pass), unlike usb.* field values.
-    local src, dst = tostring(pinfo.src), tostring(pinfo.dst)
-    local dir, ep
-    if dst == "host" then
-        dir, ep = DIR_IN, src
-    elseif src == "host" then
-        dir, ep = 0, dst
-    end
-    local dev = ep and ep:match("^(%d+%.%d+)%.%d+$")
-    if tvb:len() == 0 or not dev then
-        return false
-    end
-
+-- Decode the serial bytes of one packet; dev names the link (USB device or
+-- TCP connection), dir is DIR_IN for panel -> host.
+local function dissect_bytes(tvb, pinfo, tree, dev, dir)
     if not pinfo.visited then
         if not devices[dev] then
             -- claim a device on its first frame start: DE + a known command,
@@ -833,4 +1011,55 @@ local function heuristic(tvb, pinfo, tree)
     return true
 end
 
+local function heuristic(tvb, pinfo, tree)
+    -- USB addresses are "host" and "bus.device.endpoint". They are set even
+    -- when no tree is built (first pass), unlike usb.* field values.
+    local src, dst = tostring(pinfo.src), tostring(pinfo.dst)
+    local dir, ep
+    if dst == "host" then
+        dir, ep = DIR_IN, src
+    elseif src == "host" then
+        dir, ep = 0, dst
+    end
+    local dev = ep and ep:match("^(%d+%.%d+)%.%d+$")
+    if tvb:len() == 0 or not dev then
+        return false
+    end
+    return dissect_bytes(tvb, pinfo, tree, dev, dir)
+end
+
 p:register_heuristic("usb.bulk", heuristic)
+
+-- Serial-over-TCP bridge: the TCP payload is the raw serial stream, split
+-- anywhere; feed() reassembles the frames per connection and direction.
+function p.dissector(tvb, pinfo, tree)
+    local port = p.prefs.bridge_port
+    local dir
+    if pinfo.src_port == port then
+        dir = DIR_IN
+    elseif pinfo.dst_port == port then
+        dir = 0
+    else
+        return 0
+    end
+    -- One link per bridge, not per TCP connection: the panel keeps its
+    -- session when the client reconnects (seen when the ESP32 dropped it).
+    local panel = dir == DIR_IN and pinfo.src or pinfo.dst
+    local dev = string.format("tcp %s:%d", tostring(panel), port)
+    if tvb:len() == 0 or not dissect_bytes(tvb, pinfo, tree, dev, dir) then
+        return 0
+    end
+    return tvb:len()
+end
+
+local registered_port
+local function register_bridge_port()
+    local tcp = DissectorTable.get("tcp.port")
+    if registered_port then
+        tcp:remove(registered_port, p)
+    end
+    registered_port = p.prefs.bridge_port
+    tcp:add(registered_port, p)
+end
+p.prefs_changed = register_bridge_port
+register_bridge_port()

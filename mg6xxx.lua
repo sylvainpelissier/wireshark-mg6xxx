@@ -50,7 +50,7 @@ local LOGIN_STATUS = {
     [0x85] = "busy (previous session still open)",
 }
 local KIND = { [0x40] = "Data", [0x80] = "Ack" }
-local SERVICE = { [0x17] = "Objects", [0x18] = "Control", [0x1a] = "Programming" }
+local SERVICE = { [0x17] = "Objects", [0x18] = "Control", [0x1a] = "Programming", [0x22] = "Event log" }
 local OP = { [0x00] = "Read", [0x01] = "Write" }
 local OBJ = {
     [0x0001] = "Zone",
@@ -159,6 +159,183 @@ end
 local SERVICE_OBJECTS = 0x17
 local SERVICE_CONTROL = 0x18
 local SERVICE_PROGRAMMING = 0x1a
+local SERVICE_EVENT_LOG = 0x22
+-- Event codes = the decimal event numbers of the MG6250 programming guide,
+-- tables 11 and 12 (saved events). 489 stored events matched by date with
+-- BabyWare's report (captures/events.pdf); its wording is used where known.
+-- Table 10 (zone open/OK, partition status) is not saved in the log.
+-- Sub-event is a number: { name, what it counts }
+local LOG_EVENT_NUMBER = {
+    [7] = { "Remote Access", "user" },
+    [8] = { "Remote PGM1", "user" },
+    [9] = { "Remote PGM2", "user" },
+    [10] = { "Remote PGM3", "user" },
+    [11] = { "Remote PGM4", "user" },
+    [12] = { "Remote PGM5", "user" },
+    [13] = { "Remote PGM6", "user" },
+    [14] = { "User remote access granted", "user" },
+    [15] = { "PGM activation via phone", "output" },
+    [16] = { "Smoke beep acknowledgement", "zone" },
+    [17] = { "TX delay zone", "zone" },
+    [18] = { "Zone Signal Strength Weak 1", "zone" },
+    [19] = { "Zone Signal Strength Weak 2", "zone" },
+    [20] = { "Zone Signal Strength Weak 3", "zone" },
+    [21] = { "Zone Signal Strength Weak 4", "zone" },
+    [22] = { "Battery voltage level", "value" },
+    [23] = { "DC voltage level", "value" },
+    [24] = { "Fire delay started", "zone" },
+    [25] = { "Fire delay cancelled", "zone" },
+    [26] = { "User code entered", "user" },
+    [28] = { "StayD pass acknowledgment", "zone" },
+    [29] = { "Cold start", "zone" },
+    [30] = { "Cold start PGM", "output" },
+    [31] = { "Cold start keypad", "keypad" },
+    [32] = { "Cold start repeater", "repeater" },
+    [33] = { "Cold start siren", "siren" },
+    [40] = { "Arming with User Code", "user" },
+    [42] = { "Disarm with User Code", "user" },
+    [43] = { "Disarm after Alarm with User Code", "user" },
+    [44] = { "Cancel Alarm with User Code", "user" },
+    [46] = { "Zone Bypassed on arming", "zone" },
+    [47] = { "Zone in Alarm", "zone" },
+    [48] = { "Fire alarm", "zone" },
+    [49] = { "Zone Restore Alarm", "zone" },
+    [50] = { "Fire alarm restore", "zone" },
+    [51] = { "Zone shutdown", "zone" },
+    [53] = { "Paramedic alarm", "user" },
+    [57] = { "Tamper trouble", "zone" },
+    [58] = { "Tamper restore", "zone" },
+    [59] = { "Low battery", "zone" },
+    [60] = { "Low battery restore", "zone" },
+    [61] = { "Supervision trouble", "zone" },
+    [62] = { "Supervision restore", "zone" },
+    [63] = { "PGM tamper trouble", "PGM" },
+    [64] = { "PGM tamper trouble restore", "PGM" },
+    [65] = { "PGM supervision loss", "PGM" },
+    [66] = { "PGM supervision loss restore", "PGM" },
+    [67] = { "Keypad supervision loss", "keypad" },
+    [68] = { "Keypad supervision loss restore", "keypad" },
+    [69] = { "Keypad low battery", "keypad" },
+    [70] = { "Keypad low battery restore", "keypad" },
+    [71] = { "Keypad AC trouble", "keypad" },
+    [72] = { "Keypad AC trouble restore", "keypad" },
+    [73] = { "Repeater supervision loss", "repeater" },
+    [74] = { "Repeater supervision loss restore", "repeater" },
+    [75] = { "Repeater low battery", "repeater" },
+    [76] = { "Repeater low battery restore", "repeater" },
+    [77] = { "Repeater AC trouble", "repeater" },
+    [78] = { "Repeater AC trouble restore", "repeater" },
+    [79] = { "Siren tamper trouble", "siren" },
+    [80] = { "Siren tamper trouble restore", "siren" },
+    [81] = { "Siren supervision loss", "siren" },
+    [82] = { "Siren supervision loss restore", "siren" },
+    [83] = { "Siren low battery", "siren" },
+    [84] = { "Siren low battery restore", "siren" },
+    [85] = { "Siren AC trouble", "siren" },
+    [86] = { "Siren AC trouble restore", "siren" },
+}
+-- Sub-event selects the event
+local LOG_EVENT_SUB = {
+    [6] = {
+        [1] = "CLEAR + ENTER pressed",
+        [3] = "Stay Arming",
+        [4] = "Sleep Arming",
+        [5] = "Arm in Force mode",
+        [6] = "Full arm when armed in Stay mode",
+        [7] = "PC fail to communicate",
+        [8] = "Utility Key 1 pressed",
+        [9] = "Utility Key 2 pressed",
+        [10] = "Utility Key 3 pressed",
+        [11] = "Utility Key 4 pressed",
+        [12] = "Utility Key 5 pressed",
+        [13] = "Utility Key 6 pressed",
+        [14] = "Tamper generated alarm",
+        [15] = "Supervision loss generated alarm",
+        [16] = "Doorbell 1 battery trouble",
+        [17] = "Doorbell 1 battery trouble restore",
+        [18] = "Doorbell 2 battery trouble",
+        [19] = "Doorbell 2 battery trouble restore",
+        [20] = "Sleep to full arm",
+        [21] = "Firmware upgrade",
+        [22] = "Missing SIM card",
+        [23] = "StayD mode activated",
+        [24] = "StayD mode deactivated",
+        [25] = "IP registration status change",
+        [26] = "GPRS registration status change",
+        [27] = "Remote access denied",
+        [28] = "Fail to communicate to central station channel(s)",
+        [29] = "Fail to communicate to central station channel(s) restore",
+        [30] = "User call ended due to central polling",
+    },
+    [41] = {
+        [0] = "Auto-arming",
+        [1] = "Late to close",
+        [2] = "No movement arming",
+        [3] = "Partial Arming",
+        [4] = "Quick Arming",
+        [5] = "Software Arming",
+        [6] = "Arming with keyswitch",
+    },
+    [45] = {
+        [0] = "Auto-arm cancelled",
+        [1] = "PC Disarm",
+        [2] = "Disarmed After alarm with software",
+        [3] = "Cancel Alarm with software",
+        [4] = "Paramedic alarm cancelled",
+        [5] = "Disarm with keyswitch",
+        [6] = "Disarm with keyswitch after an alarm",
+        [7] = "Alarm cancelled with keyswitch",
+    },
+    [52] = {
+        [0] = "Panic emergency",
+        [1] = "Panic medical",
+        [2] = "Panic fire",
+        [3] = "Recent closing",
+        [4] = "Global shutdown",
+        [5] = "Duress alarm",
+        [6] = "Keypad lockout",
+    },
+    [54] = {
+        [0] = "Power Up",
+        [1] = "Test Report",
+        [2] = "Software Access",
+        [3] = "Software Access Finished",
+        [4] = "Installer on site",
+        [5] = "Installer out",
+        [6] = "Closing delinquency delay elapsed",
+        [7] = "Fail to arm",
+    },
+}
+local LOG_TROUBLE = {
+    [0] = "Telephone line",
+    [1] = "AC Failure",
+    [2] = "Battery failure",
+    [3] = "RTC",
+    [4] = "Console Tamper",
+    [5] = "RF jamming",
+    [6] = "GSM no service",
+    [7] = "GSM Supervision",
+    [8] = "IP no service",
+    [9] = "IP supervision loss",
+    [10] = "IP receiver lost",
+    [11] = "Fail to communicate to central",
+    [12] = "Fail to comm. personal reporting",
+}
+local LOG_TYPE = { [1] = "System", [2] = "Zone", [5] = "User" }
+local LOG_OP = { [0x00] = "Read events", [0x01] = "Event range" }
+local LOG_EVENT_LEN = 36
+
+local function log_event_name(code, sub)
+    local number = LOG_EVENT_NUMBER[code]
+    if number then
+        return string.format("%s, %s %d", number[1], number[2], sub)
+    elseif code == 55 or code == 56 then
+        local trouble = LOG_TROUBLE[sub] or string.format("sub %d", sub)
+        return (code == 55 and "Trouble: " or "Trouble restore: ") .. trouble
+    end
+    local names = LOG_EVENT_SUB[code]
+    return names and names[sub] or string.format("event %d sub %d", code, sub)
+end
 -- service 0x1a byte 0; BabyWare brackets every write with Begin ... End
 local PROGRAMMING_OP = { [0x00] = "Begin", [0x01] = "End" }
 local VOLTS_PER_STEP = 0.08 -- clock field 2 (battery, AC); one reading
@@ -262,6 +439,17 @@ local f = {
     ev_typed = ProtoField.uint8("mg6xxx.event.typed", "Typed (meaning unknown)", base.HEX),
     ev_label = ProtoField.string("mg6xxx.event.label", "Label"),
 
+    log_op = ProtoField.uint8("mg6xxx.log.op", "Operation", base.HEX, LOG_OP),
+    log_first = ProtoField.uint32("mg6xxx.log.first", "First event", base.HEX),
+    log_last = ProtoField.uint32("mg6xxx.log.last", "Last event", base.HEX),
+    log_count = ProtoField.uint32("mg6xxx.log.count", "Count", base.DEC),
+    log_number = ProtoField.uint32("mg6xxx.log.number", "Event number", base.HEX),
+    log_code = ProtoField.uint8("mg6xxx.log.code", "Event code", base.HEX),
+    log_sub = ProtoField.uint8("mg6xxx.log.sub", "Sub-event (zone or user number)", base.DEC),
+    log_area = ProtoField.uint8("mg6xxx.log.area", "Area", base.DEC),
+    log_date = ProtoField.string("mg6xxx.log.date", "Date"),
+    log_type = ProtoField.uint8("mg6xxx.log.type", "Label type", base.DEC, LOG_TYPE),
+    log_label = ProtoField.string("mg6xxx.log.label", "Label"),
     ctl_serial = ProtoField.bytes("mg6xxx.control.serial", "Panel serial (as in the identify reply)"),
     battery = ProtoField.float("mg6xxx.field.battery", "Battery voltage (assumed 0.08 V/step)"),
     ac = ProtoField.float("mg6xxx.field.ac", "AC voltage (assumed 0.08 V/step)"),
@@ -808,6 +996,74 @@ local function dissect_programming(d, len, tree, dir)
     return " " .. (PROGRAMMING_OP[op] or string.format("op 0x%02x", op)) .. (dir == DIR_IN and " reply" or "")
 end
 
+-- Service 0x22, records: op | len | ...; numbers are LE32.
+-- range request 01: 00 01 01 | first | ff ff ff ff
+-- range reply   01: 5 status | first | last | count
+-- read request  00: 00 01 01 | first | last | 00 00 00 00
+-- read reply    00: 5 status | first | last | count | events (one record per
+--                   fragment, 5 events each)
+-- event = number | 1f | code | sub-event | area | century year month day hour
+--         minute | 5 unknown | label type | label (16)
+local function dissect_event_log(d, tree, dir)
+    local n = d:len()
+    local i = 0
+    local info = ""
+    while i + 2 <= n and d(i, 1):uint() ~= 0xee do
+        local op, len = d(i, 1):uint(), d(i + 1, 1):uint()
+        if len < 2 or i + len > n then
+            break
+        end
+        local name = LOG_OP[op] or string.format("op 0x%02x", op)
+        local rt = tree:add(p, d(i, len), "Record: " .. name)
+        rt:add(f.log_op, d(i, 1))
+        rt:add(f.rlen, d(i + 1, 1))
+        local head = dir == DIR_IN and 7 or 5
+        if op > 0x01 or len < head + 8 then
+            add_uninterp(rt, d, i + 2, i + len)
+        else
+            add_uninterp(rt, d, i + 2, i + head)
+            local a = i + head
+            rt:add_le(f.log_first, d(a, 4))
+            rt:add_le(f.log_last, d(a + 4, 4))
+            local first, last = d(a, 4):le_uint(), d(a + 4, 4):le_uint()
+            local text = last == 0xffffffff and string.format(" 0x%x", first)
+                or string.format(" 0x%x-0x%x", first, last)
+            rt:append_text(text)
+            info = info .. " " .. name .. text
+            a = a + 8
+            if a + 4 <= i + len then
+                if dir == DIR_IN then
+                    rt:add_le(f.log_count, d(a, 4))
+                else
+                    add_uninterp(rt, d, a, a + 4)
+                end
+                a = a + 4
+            end
+            while dir == DIR_IN and op == 0x00 and a + LOG_EVENT_LEN <= i + len do
+                local date = string.format("%02d%02d-%02d-%02d %02d:%02d", d(a + 8, 1):uint(), d(a + 9, 1):uint(),
+                    d(a + 10, 1):uint(), d(a + 11, 1):uint(), d(a + 12, 1):uint(), d(a + 13, 1):uint())
+                local ename = log_event_name(d(a + 5, 1):uint(), d(a + 6, 1):uint())
+                local et = rt:add(p, d(a, LOG_EVENT_LEN),
+                    string.format("Event 0x%x: %s, %s", d(a, 4):le_uint(), date, ename))
+                et:add_le(f.log_number, d(a, 4))
+                add_uninterp(et, d, a + 4, a + 5)
+                et:add(f.log_code, d(a + 5, 1))
+                et:add(f.log_sub, d(a + 6, 1))
+                et:add(f.log_area, d(a + 7, 1))
+                et:add(f.log_date, d(a + 8, 6), date)
+                add_uninterp(et, d, a + 14, a + 19)
+                et:add(f.log_type, d(a + 19, 1))
+                et:add(f.log_label, d(a + 20, 16))
+                a = a + LOG_EVENT_LEN
+            end
+            add_uninterp(rt, d, a, i + len)
+        end
+        i = i + len
+    end
+    add_padding(tree, d, i)
+    return info
+end
+
 local function dissect_data(t, o, e, tree, dir, key, root)
     if o >= e then
         return "Data"
@@ -869,6 +1125,8 @@ local function dissect_data(t, o, e, tree, dir, key, root)
     local dt = tree:add(p, d(), "Data (session key)")
     if service == SERVICE_OBJECTS then
         info = info .. dissect_records(d, dt, dir)
+    elseif service == SERVICE_EVENT_LOG then
+        info = info .. dissect_event_log(d, dt, dir)
     elseif service == SERVICE_CONTROL or service == SERVICE_PROGRAMMING then
         -- the panel's padding count is one more than the bytes it pads
         local len = d:len() - pad + (dir == DIR_IN and pad > 0 and 1 or 0)

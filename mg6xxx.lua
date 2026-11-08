@@ -135,7 +135,9 @@ local OBJ_SYSTEM = 0x001c -- field 1 byte 0: change counter
 local OBJ_ZONE_STATUS = 0x001e -- field 0 byte 0: non-zero = open (04 in alarm), byte 1: flags
 -- disarmed 00 00 00; exit delay 01 / 02 / 03 00 01, armed 05 / 06 / 07
 -- 00 00 for stay / sleep / full arm (armed-stay-*, slepp-armed-*,
--- alarm-ir-etage); alarm (full arm, zone 15) 77 02 40, provisional.
+-- alarm-ir-etage); alarm (full arm, zone 15) 77 02 40, provisional. Second
+-- byte: 02 after an alarm (exit-delay-audio), 10 armed with a zone open: 03 10 01
+-- then 07 10 00 (arm-bypass-disarm, same 0x13 arm as with all zones closed).
 -- Index 1-2: partition 1-2 (BabyWare reads both, #2 stayed zero).
 local OBJ_PARTITION_STATUS = 0x0025
 local ARM_MODE = { [0] = "Disarmed", [1] = "Stay", [2] = "Sleep", [3] = "Full" }
@@ -349,6 +351,11 @@ local OBJ_AREA = 0x001a -- field 1 byte 0: exit delay (30 s, as on arming)
 -- label field of objects whose field 0 is not a serial
 local LABEL_FIELD = { [0x0003] = 1, [0x0005] = 1, [0x0007] = 1, [0x001a] = 2 }
 -- service 0x18 action byte, one capture each
+-- first byte of the request and reply, then the target number after the action
+-- (bypass: 0c = zone 12; the partition's is 01 in every capture)
+local CONTROL_TYPE = { [0x00] = "Partition", [0x01] = "Zone" }
+local CONTROL_TYPE_ZONE = 0x01
+local ZONE_BYPASS = { [0x00] = "Clear bypass", [0x01] = "Bypass" } -- bypass
 local CONTROL_ACTION = {
     [0x10] = "Disarm", -- arm-full-09
     [0x11] = "Arm stay", -- stay
@@ -474,14 +481,20 @@ local f = {
     part_armed = ProtoField.bool("mg6xxx.field.partition_armed", "Armed (exit delay over)", 8, nil, 0x04),
     part_alarm = ProtoField.bool("mg6xxx.field.partition_alarm",
         "Alarm (0x10, 0x20, 0x40: all set in the one sample)", 8, nil, 0x70),
-    part_flags2 = ProtoField.uint8("mg6xxx.field.partition_flags2",
-        "Flags (alarm: 0x02, meaning unknown)", base.HEX),
+    part_flags2 = ProtoField.uint8("mg6xxx.field.partition_flags2", "Flags", base.HEX),
+    part_memory = ProtoField.bool("mg6xxx.field.partition_alarm_memory",
+        "Alarm in memory (provisional)", 8, nil, 0x02),
+    part_forced = ProtoField.bool("mg6xxx.field.partition_forced",
+        "Armed with an open zone (provisional)", 8, nil, 0x10),
     part_flags3 = ProtoField.uint8("mg6xxx.field.partition_flags3", "Flags", base.HEX),
     part_exit_delay = ProtoField.bool("mg6xxx.field.partition_exit_delay", "Exit delay", 8, nil, 0x01),
     part_alarm3 = ProtoField.bool("mg6xxx.field.partition_alarm3", "Alarm (meaning unknown)", 8, nil, 0x40),
     change_counter = ProtoField.uint8("mg6xxx.field.change_counter",
         "Change counter (BabyWare re-reads zone status when it changes)", base.DEC),
     ctl_action = ProtoField.uint8("mg6xxx.control.action", "Action", base.HEX, CONTROL_ACTION),
+    ctl_type = ProtoField.uint8("mg6xxx.control.type", "Target type", base.HEX, CONTROL_TYPE),
+    ctl_target = ProtoField.uint8("mg6xxx.control.target", "Target number", base.DEC),
+    ctl_bypass = ProtoField.uint8("mg6xxx.control.bypass", "Zone action", base.HEX, ZONE_BYPASS),
 
     uninterp = ProtoField.bytes("mg6xxx.uninterpreted", "Uninterpreted"),
     padding = ProtoField.bytes("mg6xxx.padding", "Padding"),
@@ -580,7 +593,8 @@ local function learn_session(dev, dir, frame)
         return
     end
     local b = body_offset(frame)
-    if frame:byte(b + 1) ~= 0x00 then
+    -- session id 01 is the logout: no key in its reply
+    if frame:byte(b) ~= 0x02 or frame:byte(b + 1) ~= 0x00 then
         return
     end
     local plain = decrypt_login_reply(frame:sub(b + 2, #frame - 2), p.prefs.password)
@@ -675,6 +689,28 @@ local function add_padding(tree, t, o)
     if t:len() > o then
         tree:add(f.padding, t(o, t:len() - o))
     end
+end
+
+-- cmd 0x01 with session id 01 (refresh-disconnect). Request: selector | mode,
+-- reply: status | selector | mode. The panel accepts a new login after it.
+local function dissect_logout(t, o, e, tree, dir)
+    local status
+    if dir == DIR_IN and o < e then
+        status = t(o, 1):uint()
+        tree:add(f.status, t(o, 1))
+        o = o + 1
+    end
+    if o + 2 <= e then
+        tree:add(f.selector, t(o, 1))
+        tree:add(f.lmode, t(o + 1, 1))
+        add_uninterp(tree, t, o + 2, e)
+    else
+        add_uninterp(tree, t, o, e)
+    end
+    if dir == DIR_IN then
+        return "Logout reply: " .. (LOGIN_STATUS[status] or string.format("status 0x%02x", status or 0))
+    end
+    return "Logout"
 end
 
 local function dissect_login(t, o, e, tree, dir)
@@ -775,7 +811,9 @@ local function interpret_value(rt, ft, obj, fid, v, size)
         st:add(f.part_arming, v(0, 1))
         st:add(f.part_armed, v(0, 1))
         st:add(f.part_alarm, v(0, 1))
-        ft:add(f.part_flags2, v(1, 1))
+        local t2 = ft:add(f.part_flags2, v(1, 1))
+        t2:add(f.part_memory, v(1, 1))
+        t2:add(f.part_forced, v(1, 1))
         local t3 = ft:add(f.part_flags3, v(2, 1))
         t3:add(f.part_exit_delay, v(2, 1))
         t3:add(f.part_alarm3, v(2, 1))
@@ -961,15 +999,24 @@ local function dissect_control(d, len, tree, dir)
         add_padding(tree, d, len)
         return ""
     end
-    tree:add(f.uninterp, d(0, 7))
+    tree:add(f.ctl_type, d(0, 1))
+    tree:add(f.uninterp, d(1, 6))
     tree:add(f.ctl_serial, d(7, 4))
     local info
     if dir ~= DIR_IN then
-        if len > 11 then
-            local action = d(11, 1):uint()
-            tree:add(f.ctl_action, d(11, 1))
-            add_uninterp(tree, d, 12, len)
-            info = " " .. (CONTROL_ACTION[action] or string.format("action 0x%02x", action))
+        if len > 12 then
+            local action, target = d(11, 1):uint(), d(12, 1):uint()
+            if d(0, 1):uint() == CONTROL_TYPE_ZONE then
+                tree:add(f.ctl_bypass, d(11, 1))
+                tree:add(f.ctl_target, d(12, 1))
+                info = string.format(" %s zone %d", ZONE_BYPASS[action] or
+                    string.format("action 0x%02x", action), target)
+            else
+                tree:add(f.ctl_action, d(11, 1))
+                tree:add(f.ctl_target, d(12, 1))
+                info = " " .. (CONTROL_ACTION[action] or string.format("action 0x%02x", action))
+            end
+            add_uninterp(tree, d, 13, len)
         else
             info = " command"
         end
@@ -1215,6 +1262,8 @@ local function dissect_frame(t, root, dir, key)
     if cmd == 0x00 then
         add_uninterp(ft, t, o, e)
         info = dir == DIR_IN and "Identify reply" or "Identify"
+    elseif cmd == 0x01 and o > 0 and t(o - 1, 1):uint() == 0x01 then
+        info = dissect_logout(t, o, e, ft, dir)
     elseif cmd == 0x01 then
         info = dissect_login(t, o, e, ft, dir)
     elseif cmd == 0x24 then

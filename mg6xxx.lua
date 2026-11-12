@@ -6,9 +6,11 @@
 -- reads (zone/keypad/repeater/siren labels and serials, panel clock), and
 -- writes (op 0x01, e.g. a user code), the service 0x1a programming
 -- session around them, service 0x18 control commands (arm, arm stay, arm
--- sleep, disarm), zone open/closed and alarm flags
--- (object 0x1e), partition exit delay/armed/alarm (object 0x25, provisional)
--- and the change counter BabyWare polls (object 0x1c).
+-- sleep, disarm of partitions 1-2, zone bypass, PGM activate/deactivate/release),
+-- zone open/bypassed and alarm flags (object 0x1e), partition exit
+-- delay/armed/alarm (object 0x25, provisional), the option sections
+-- [2000]-[2008] (object 0x17 field 1) and the change counter BabyWare polls
+-- (object 0x1c). The transaction id is a byte: 255 is followed by 0.
 -- Also the cleartext event frames the panel sends on its own, using the
 -- layout of https://github.com/bmpc/mg6250_mqtt (paradox_serial_connect.py):
 -- any other command whose body is N x 37 bytes. Not yet checked against a
@@ -68,6 +70,7 @@ local OBJ = {
     [0x0019] = "Installer / PC login",
     [0x001a] = "Area",
     [0x001e] = "Zone status",
+    [0x0020] = "PGM status?",
     [0x0024] = "Clock",
     [0x0025] = "Partition status",
 }
@@ -132,13 +135,19 @@ local ZONE_PARTITION = { [1] = "Partition 1", [2] = "Partition 2", [3] = "Both p
 -- table 6, options 4-5
 local ZONE_ALARM_TYPE = { [0] = "Audible", [1] = "Silent", [2] = "Audible pulse", [3] = "Report only" }
 local OBJ_SYSTEM = 0x001c -- field 1 byte 0: change counter
-local OBJ_ZONE_STATUS = 0x001e -- field 0 byte 0: non-zero = open (04 in alarm), byte 1: flags
+-- field 0 byte 0: 0x20 bypassed, any other bit = open (04 in alarm); byte 1:
+-- flags; byte 2: 0x04 exit delay of partition 2 (byte 1 0x04 is partition 1's).
+-- long-tid-wrapped-many-operations: ENTREE 20 00 00 from bypass to clear.
+local OBJ_ZONE_STATUS = 0x001e
+local ZONE_BYPASSED = 0x20
 -- disarmed 00 00 00; exit delay 01 / 02 / 03 00 01, armed 05 / 06 / 07
 -- 00 00 for stay / sleep / full arm (armed-stay-*, slepp-armed-*,
 -- alarm-ir-etage); alarm (full arm, zone 15) 77 02 40, provisional. Second
 -- byte: 02 after an alarm (exit-delay-audio), 10 armed with a zone open: 03 10 01
 -- then 07 10 00 (arm-bypass-disarm, same 0x13 arm as with all zones closed).
--- Index 1-2: partition 1-2 (BabyWare reads both, #2 stayed zero).
+-- Index 1-2: partition 1-2, same layout (long-tid-wrapped-many-operations: #2
+-- 01 00 01 then 05 00 00 on a stay arm of area 2). Second byte 04 while a zone
+-- was bypassed (provisional, one capture).
 local OBJ_PARTITION_STATUS = 0x0025
 local ARM_MODE = { [0] = "Disarmed", [1] = "Stay", [2] = "Sleep", [3] = "Full" }
 
@@ -340,7 +349,13 @@ local function log_event_name(code, sub)
 end
 -- service 0x1a byte 0; BabyWare brackets every write with Begin ... End
 local PROGRAMMING_OP = { [0x00] = "Begin", [0x01] = "End" }
-local VOLTS_PER_STEP = 0.08 -- clock field 2 (battery, AC); one reading
+-- reply bytes 8-9. An End 113 s after its Begin got 01 00: the session had
+-- timed out (Begin's 3c 00 = 60 s).
+local PROGRAMMING_STATUS = { [0x0000] = "OK", [0x0100] = "Session timed out" }
+-- object 0x17 field 1: one byte per section from [2000], option 1 = bit 0
+local SETTINGS_SECTIONS = 9
+local VOLTS_PER_STEP = 0.08 -- clock field 2, battery: 42 = 5.3 V in BabyWare
+local AC_VOLTS_PER_STEP = 0.079 -- AC: 5f = 7.5 V in BabyWare (2026-11-11)
 -- receive-all: users 1-16, field 1 label, field 4 code (System Master's
 -- matches the user code). 0x19 field 1 has the same layout and holds the
 -- installer code (A6 27 for 0627: A = digit 0?); change-user-code wrote
@@ -353,8 +368,13 @@ local LABEL_FIELD = { [0x0003] = 1, [0x0005] = 1, [0x0007] = 1, [0x001a] = 2 }
 -- service 0x18 action byte, one capture each
 -- first byte of the request and reply, then the target number after the action
 -- (bypass: 0c = zone 12; the partition's is 01 in every capture)
-local CONTROL_TYPE = { [0x00] = "Partition", [0x01] = "Zone" }
+local CONTROL_TYPE = { [0x00] = "Partition", [0x01] = "Zone", [0x03] = "PGM" }
+local CONTROL_TYPE_PARTITION = 0x00
 local CONTROL_TYPE_ZONE = 0x01
+local CONTROL_TYPE_PGM = 0x03
+-- long-tid-wrapped-many-operations: Activate, Deactivate, Release on PGM 1
+-- then 2 sent 02, 01, 03 (from the order of the clicks)
+local PGM_ACTION = { [0x01] = "Deactivate", [0x02] = "Activate", [0x03] = "Release" }
 local ZONE_BYPASS = { [0x00] = "Clear bypass", [0x01] = "Bypass" } -- bypass
 local CONTROL_ACTION = {
     [0x10] = "Disarm", -- arm-full-09
@@ -459,7 +479,15 @@ local f = {
     log_label = ProtoField.string("mg6xxx.log.label", "Label"),
     ctl_serial = ProtoField.bytes("mg6xxx.control.serial", "Panel serial (as in the identify reply)"),
     battery = ProtoField.float("mg6xxx.field.battery", "Battery voltage (assumed 0.08 V/step)"),
-    ac = ProtoField.float("mg6xxx.field.ac", "AC voltage (assumed 0.08 V/step)"),
+    ac = ProtoField.float("mg6xxx.field.ac", "AC voltage (0.079 V/step, one reading)"),
+    options = ProtoField.bytes("mg6xxx.field.options", "Option sections"),
+    opt_section = ProtoField.uint8("mg6xxx.field.options.section", "Section", base.HEX),
+    opt_code_len = ProtoField.bool("mg6xxx.field.options.code_4_digits",
+        "[2000] 1: access codes have 4 digits (off: 6)", 8, nil, 0x01),
+    opt_two_partitions = ProtoField.bool("mg6xxx.field.options.two_partitions",
+        "[2000] 7: two partitions", 8, nil, 0x40),
+    opt_auto_time = ProtoField.bool("mg6xxx.field.options.auto_time_adjust",
+        "[2001] 8: auto-time adjust", 8, nil, 0x80),
     user_code = ProtoField.string("mg6xxx.field.user_code", "Code (BCD, first 4 digits)"),
     pc_login = ProtoField.string("mg6xxx.field.pc_login", "Login name"),
     pc_password = ProtoField.string("mg6xxx.field.pc_password", "PC password"),
@@ -468,6 +496,10 @@ local f = {
         "Repeats digits 1-2 (in both captures; meaning unknown)", base.HEX),
     prog_op = ProtoField.uint8("mg6xxx.programming.op", "Programming", base.HEX, PROGRAMMING_OP),
     zone_open = ProtoField.bool("mg6xxx.field.zone_open", "Zone open"),
+    zone_bypassed = ProtoField.bool("mg6xxx.field.zone_bypassed", "Bypassed"),
+    zone_flags2 = ProtoField.uint8("mg6xxx.field.zone_flags2", "Zone flags, partition 2", base.HEX),
+    zone_exit_delay2 = ProtoField.bool("mg6xxx.field.zone_exit_delay2",
+        "Exit delay of partition 2", 8, nil, 0x04),
     -- zone status byte 1, provisional (alarm-ir-etage, set-sms)
     zone_flags = ProtoField.uint8("mg6xxx.field.zone_flags", "Zone flags (provisional)", base.HEX),
     zone_exit_delay = ProtoField.bool("mg6xxx.field.zone_exit_delay",
@@ -484,6 +516,8 @@ local f = {
     part_flags2 = ProtoField.uint8("mg6xxx.field.partition_flags2", "Flags", base.HEX),
     part_memory = ProtoField.bool("mg6xxx.field.partition_alarm_memory",
         "Alarm in memory (provisional)", 8, nil, 0x02),
+    part_bypass = ProtoField.bool("mg6xxx.field.partition_bypass",
+        "A zone is bypassed (provisional)", 8, nil, 0x04),
     part_forced = ProtoField.bool("mg6xxx.field.partition_forced",
         "Armed with an open zone (provisional)", 8, nil, 0x10),
     part_flags3 = ProtoField.uint8("mg6xxx.field.partition_flags3", "Flags", base.HEX),
@@ -495,6 +529,8 @@ local f = {
     ctl_type = ProtoField.uint8("mg6xxx.control.type", "Target type", base.HEX, CONTROL_TYPE),
     ctl_target = ProtoField.uint8("mg6xxx.control.target", "Target number", base.DEC),
     ctl_bypass = ProtoField.uint8("mg6xxx.control.bypass", "Zone action", base.HEX, ZONE_BYPASS),
+    ctl_pgm = ProtoField.uint8("mg6xxx.control.pgm_action", "PGM action", base.HEX, PGM_ACTION),
+    prog_status = ProtoField.uint16("mg6xxx.programming.status", "Status", base.HEX, PROGRAMMING_STATUS),
 
     uninterp = ProtoField.bytes("mg6xxx.uninterpreted", "Uninterpreted"),
     padding = ProtoField.bytes("mg6xxx.padding", "Padding"),
@@ -789,9 +825,14 @@ local function interpret_value(rt, ft, obj, fid, v, size)
         ft:add(f.label, v)
         rt:append_text(": " .. v:string():gsub("[%z ]+$", ""))
     elseif obj == OBJ_ZONE_STATUS and fid == 0 then
-        local open = v(0, 1):uint() ~= 0
+        local b0 = v(0, 1):uint()
+        local open = b0 & ~ZONE_BYPASSED ~= 0
         ft:add(f.zone_open, v(0, 1), open)
+        ft:add(f.zone_bypassed, v(0, 1), b0 & ZONE_BYPASSED ~= 0)
         rt:append_text(open and ": open" or ": closed")
+        if b0 & ZONE_BYPASSED ~= 0 then
+            rt:append_text(", bypassed")
+        end
         if size >= 2 then
             local flags = v(1, 1):uint()
             local zt = ft:add(f.zone_flags, v(1, 1))
@@ -804,7 +845,10 @@ local function interpret_value(rt, ft, obj, fid, v, size)
                 rt:append_text(", alarm in memory")
             end
         end
-        add_uninterp(ft, v, 2, size)
+        if size >= 3 then
+            ft:add(f.zone_flags2, v(2, 1)):add(f.zone_exit_delay2, v(2, 1))
+        end
+        add_uninterp(ft, v, 3, size)
     elseif obj == OBJ_PARTITION_STATUS and fid == 0 and size >= 3 then
         local state, flags3 = v(0, 1):uint(), v(2, 1):uint()
         local st = ft:add(f.part_state, v(0, 1))
@@ -813,6 +857,7 @@ local function interpret_value(rt, ft, obj, fid, v, size)
         st:add(f.part_alarm, v(0, 1))
         local t2 = ft:add(f.part_flags2, v(1, 1))
         t2:add(f.part_memory, v(1, 1))
+        t2:add(f.part_bypass, v(1, 1))
         t2:add(f.part_forced, v(1, 1))
         local t3 = ft:add(f.part_flags3, v(2, 1))
         t3:add(f.part_exit_delay, v(2, 1))
@@ -828,6 +873,22 @@ local function interpret_value(rt, ft, obj, fid, v, size)
         elseif state == 0 then
             rt:append_text(": disarmed")
         end
+    elseif obj == OBJ_SETTINGS and fid == 1 and size >= 2 then
+        local ot = ft:add(f.options, v(0, math.min(size, SETTINGS_SECTIONS)))
+        for i = 0, math.min(size, SETTINGS_SECTIONS) - 1 do
+            local st = ot:add(f.opt_section, v(i, 1))
+            st:prepend_text(string.format("[%d] ", 2000 + i))
+            if i == 0 then
+                st:add(f.opt_code_len, v(i, 1))
+                st:add(f.opt_two_partitions, v(i, 1))
+            elseif i == 1 then
+                st:add(f.opt_auto_time, v(i, 1))
+            end
+        end
+        add_uninterp(ft, v, SETTINGS_SECTIONS, size)
+        local b0 = v(0, 1):uint()
+        rt:append_text(string.format(": %s, %d-digit codes",
+            b0 & 0x40 ~= 0 and "two partitions" or "one partition", b0 & 0x01 ~= 0 and 4 or 6))
     elseif obj == OBJ_SETTINGS and fid == 3 and size >= 2 then
         ft:add(f.entry_audio, v(0, 1))
         ft:add(f.exit_audio, v(1, 1))
@@ -838,10 +899,9 @@ local function interpret_value(rt, ft, obj, fid, v, size)
         ft:add(f.change_counter, v(0, 1))
         add_uninterp(ft, v, 1, size)
     elseif obj == OBJ_CLOCK and fid == 2 and size >= 2 then
-        -- 42 00 0c while BabyWare showed Battery 5.3 V, AC 0.0: 0.08 V/step
-        -- fits that one reading; the third byte is unknown
+        -- battery 42 = 5.3 V, AC 5f = 7.5 V in BabyWare; the third byte is unknown
         local battery = v(0, 1):uint() * VOLTS_PER_STEP
-        local ac = v(1, 1):uint() * VOLTS_PER_STEP
+        local ac = v(1, 1):uint() * AC_VOLTS_PER_STEP
         ft:add(f.battery, v(0, 1), battery):append_text(string.format(" V (raw %d)", v(0, 1):uint()))
         ft:add(f.ac, v(1, 1), ac):append_text(string.format(" V (raw %d)", v(1, 1):uint()))
         add_uninterp(ft, v, 2, size)
@@ -1006,15 +1066,23 @@ local function dissect_control(d, len, tree, dir)
     if dir ~= DIR_IN then
         if len > 12 then
             local action, target = d(11, 1):uint(), d(12, 1):uint()
-            if d(0, 1):uint() == CONTROL_TYPE_ZONE then
+            local ctype = d(0, 1):uint()
+            local unknown = string.format("action 0x%02x", action)
+            if ctype == CONTROL_TYPE_ZONE then
                 tree:add(f.ctl_bypass, d(11, 1))
                 tree:add(f.ctl_target, d(12, 1))
-                info = string.format(" %s zone %d", ZONE_BYPASS[action] or
-                    string.format("action 0x%02x", action), target)
+                info = string.format(" %s zone %d", ZONE_BYPASS[action] or unknown, target)
+            elseif ctype == CONTROL_TYPE_PGM then
+                tree:add(f.ctl_pgm, d(11, 1))
+                tree:add(f.ctl_target, d(12, 1))
+                info = string.format(" %s PGM %d", PGM_ACTION[action] or unknown, target)
             else
                 tree:add(f.ctl_action, d(11, 1))
                 tree:add(f.ctl_target, d(12, 1))
-                info = " " .. (CONTROL_ACTION[action] or string.format("action 0x%02x", action))
+                info = " " .. (CONTROL_ACTION[action] or unknown)
+                if ctype == CONTROL_TYPE_PARTITION then
+                    info = info .. string.format(" partition %d", target)
+                end
             end
             add_uninterp(tree, d, 13, len)
         else
@@ -1029,8 +1097,8 @@ local function dissect_control(d, len, tree, dir)
 end
 
 -- Service 0x1a: byte 0 begins (00) or ends (01) a programming session around
--- writes. The rest (00 00 00, ff ff ff ff, then 3c 00 on Begin: maybe a 60 s
--- timeout) and the reply's trailing 00 00 are not decoded.
+-- writes. Then 00 00 00, ff ff ff ff, and 3c 00 on Begin (60 s timeout). The
+-- reply echoes the first 8 bytes, then a 2-byte status.
 local function dissect_programming(d, len, tree, dir)
     if len < 1 then
         add_padding(tree, d, 0)
@@ -1038,9 +1106,20 @@ local function dissect_programming(d, len, tree, dir)
     end
     local op = d(0, 1):uint()
     tree:add(f.prog_op, d(0, 1))
-    add_uninterp(tree, d, 1, len)
+    local status = ""
+    if dir == DIR_IN and len >= 10 then
+        add_uninterp(tree, d, 1, 8)
+        local code = d(8, 2):uint()
+        tree:add(f.prog_status, d(8, 2))
+        if code ~= 0 then
+            status = ": " .. (PROGRAMMING_STATUS[code] or string.format("status %04x", code))
+        end
+        add_uninterp(tree, d, 10, len)
+    else
+        add_uninterp(tree, d, 1, len)
+    end
     add_padding(tree, d, len)
-    return " " .. (PROGRAMMING_OP[op] or string.format("op 0x%02x", op)) .. (dir == DIR_IN and " reply" or "")
+    return " " .. (PROGRAMMING_OP[op] or string.format("op 0x%02x", op)) .. (dir == DIR_IN and " reply" or "") .. status
 end
 
 -- Service 0x22, records: op | len | ...; numbers are LE32.

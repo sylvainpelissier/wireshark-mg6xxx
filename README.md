@@ -59,20 +59,31 @@ Frame layout: `DE | cmd (LE16) | LEN (LE16) | lenA | lenB | A | B | body | CRC16
 | Command | Supported |
 | --- | --- |
 | `0x00` Identify | Frame header |
-| `0x01` Login | Request (password block, username) and reply (status, decrypted session id, session key and user label) |
+| `0x01` Login | Request (password block, username) and reply (status, decrypted session id, session key and user label); logout (session id 01) and its reply |
 | `0x24` Data | Decrypted header (transaction id, fragment, ack/data, service, session) and the records below |
 | Other, N × 37-byte body | Cleartext events sent by the panel (zone OK/open, partition arm/disarm/alarm), using the layout from [bmpc/mg6250_mqtt](https://github.com/bmpc/mg6250_mqtt). Not yet checked against a capture. |
 
 Data frame services:
 
 - **`0x17` Objects**: reads and writes of panel objects:
-  - zone, keypad, repeater and siren serials and labels;
-  - panel clock (date, battery and AC voltage; the voltage scale is assumed);
+  - zone, keypad, repeater and siren serials and labels, zone definition,
+    partition and options;
+  - panel clock (date, battery and AC voltage; the voltage scale comes from
+    one reading each);
   - user codes (BCD; seen when changing a user code);
-  - zone status (open/closed);
+  - zone status (open, bypassed, alarm, exit delay of partitions 1 and 2);
+  - partition status of partitions 1 and 2 (arm mode, armed, exit delay,
+    alarm; partly provisional);
+  - option sections [2000]-[2008] (code length, two partitions, auto-time
+    adjust);
   - the system change counter that BabyWare polls.
-- **`0x18` Control**: arm, arm stay, arm sleep and disarm.
-- **`0x1a` Programming**: the begin/end markers BabyWare puts around writes.
+- **`0x18` Control**: arm, arm stay, arm sleep and disarm with the partition
+  number, zone bypass and clear, PGM activate, deactivate and release.
+- **`0x1a` Programming**: the begin/end markers BabyWare puts around writes,
+  and the reply status (a session older than 60 s has timed out).
+- **`0x22` Event log**: range and read requests, and the events in the replies.
+
+The transaction id in the data header is one byte: it goes from 255 to 0.
 
 Anything not recognised is shown as "Uninterpreted", so the remaining bytes
 are still visible.
